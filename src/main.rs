@@ -254,18 +254,37 @@ fn solve(
         // the stack of combinations of teams and strikes to check while searching
         let mut iter_stack = vec![get_iter(curr_mask, mulligans); 1];
 
-        iter_stack.extend(
+        if curr_mask.count_ones() < max_round - 1 {
+            iter_stack.extend(
+                (0..num_teams)
+                    .filter(|&idx| ((1 as TeamsMask) << (idx as u32)) & curr_mask == 0)
+                    .flat_map(|idx| {
+                        (0..=mulligans.min(1)).map(move |num| {
+                            get_iter(
+                                curr_mask | ((1 as TeamsMask) << (idx as u32)),
+                                mulligans - num,
+                            )
+                        })
+                    }),
+            );
+        } else {
             (0..num_teams)
                 .filter(|&idx| ((1 as TeamsMask) << (idx as u32)) & curr_mask == 0)
-                .flat_map(|idx| {
-                    (0..=mulligans.min(1)).map(move |num| {
-                        get_iter(
-                            curr_mask | ((1 as TeamsMask) << (idx as u32)),
-                            mulligans - num,
-                        )
-                    })
-                }),
-        );
+                .for_each(|idx| {
+                    let mask = ((1 as TeamsMask) << (idx as u32)) | curr_mask;
+                    let row = (curr_mask.count_ones() - round_offset) as usize;
+                    let p = probs[row * num_teams + idx].1;
+                    if mulligans > 0 {
+                        max_expected.insert((mask, mulligans), 1.0);
+                        max_expected.insert((mask, mulligans - 1), 1.0);
+                    } else {
+                        max_expected.insert(
+                            (mask, mulligans),
+                            p + (1.0 - p) * winning_prob[curr_mask.count_ones() as usize],
+                        );
+                    }
+                });
+        }
 
         'outer: while !iter_stack.is_empty() {
             // Safety: garunteed by the while loop check
@@ -422,14 +441,14 @@ fn main() -> Result<()> {
     let max_round = odds.len() / num_teams + args.starting_round as usize;
     let winning_prob: Vec<_> = (0..=max_round)
         .map(|x| {
-            x.saturating_sub(8.min(max_round.saturating_sub(1))) as f32
-                / max_round.saturating_sub(8.min(max_round.saturating_sub(1))) as f32
+            x.saturating_sub(5.min(max_round.saturating_sub(1))) as f32
+                / max_round.saturating_sub(5.min(max_round.saturating_sub(1))) as f32
         })
         .map(sstep)
         .collect();
 
     println!("|{:=^78}|", "");
-    println!("|{:^78}|", "Current Win Probabilty by Round Exited");
+    println!("|{:^78}|", "Assumed Win Probabilty by Round Exited");
     println!("|{:=^7}|{:=^70}|", "", "");
     winning_prob.chunks(9).enumerate().for_each(|(row, chunk)| {
         print!("| {:<5} |   ", "Round");
@@ -455,11 +474,13 @@ fn main() -> Result<()> {
     )
     .context("unable to solve for max win prob")?;
 
+    println!();
     println!("|={:=<62}=|", "");
     println!(
         "| Round {:>55}. |",
         curr_mask.count_ones() - args.starting_round + 1
     );
+    println!("| Mulligans {:>51}. |", args.mulligans);
     println!("|={:=<24}=|={:=^16}=|={:=^16}=|", "", "", "");
     println!(
         "| {:<24} | {:^16} | {:^16} |",
