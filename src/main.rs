@@ -1,8 +1,29 @@
-use std::{collections::HashMap, f32, iter, ops::ControlFlow};
+use std::{collections::HashMap, f32, fs, iter, ops::ControlFlow, path::PathBuf};
 
 use anyhow::{Context, Result};
+use clap::{Parser, command};
 
-const ODDS_DATA: &str = include_str!("../nfl_odds.csv");
+/// A simple program for derriving the max win proability for a survivor pool based on a table of
+/// win probabilities for each round in a csv file.
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Path to the csv file containing the probability data
+    #[arg(short, long, value_name = "FILE")]
+    prob_file_path: PathBuf,
+
+    #[arg(value_name = "TEAM")]
+    teams: Vec<String>,
+
+    /// The first round of the the probability data (not neccessarilly the current round of the
+    /// pool)
+    #[arg(short, long, default_value_t = 0)]
+    starting_round: u32,
+
+    /// The number of mulligans you have at your disposal
+    #[arg(short, long, default_value_t = 0)]
+    mulligans: u32,
+}
 
 fn read_csv(s: &str) -> Result<(Vec<&str>, Vec<f32>)> {
     // using split instaed of split lines to avoid creating Strings
@@ -78,7 +99,7 @@ const fn bin_co(n: u32, k: u32) -> u32 {
     num as u32
 }
 
-const SSTEP_N: u32 = 5;
+const SSTEP_N: u32 = 2;
 /// smoothstep function change `SSTEP_N` to affect how smooth it is
 fn sstep(x: f32) -> f32 {
     const COEFFS: [f32; SSTEP_N as usize + 1] = {
@@ -115,34 +136,25 @@ fn sstep(x: f32) -> f32 {
     }
 }
 
-fn main() -> Result<()> {
-    let (teams, odds) = read_csv(ODDS_DATA).context("unable to read the csv file")?;
-    (TeamsMask::BITS as usize >= teams.len())
+fn solve(
+    odds: &[f32],
+    winning_prob: &[f32],
+    num_teams: usize,
+    curr_teams: TeamsMask,
+    mulligans: u32,
+    round_offset: u32,
+) -> Result<Vec<(usize, f32, f32)>> {
+    let max_round = (odds.len() / num_teams) as u32 + round_offset;
+    // dbg!(max_round);
+    // return Ok(());
+
+    (odds.len() % num_teams == 0)
         .then_some(())
-        .with_context(|| {
-            format!(
-                "too many teams for the size of `TeamsMask`: {}",
-                teams.len()
-            )
-        })?;
+        .context("you must have odds for every team in every week")?;
 
-    let num_teams = teams.len();
-
-    let max_round = (odds.len() / num_teams) as u32;
-    let max_strikes = 1u32;
-
-    (max_round as usize <= odds.len() / teams.len())
+    (curr_teams.count_ones() >= round_offset)
         .then_some(())
-        .context("you must have data for at least `max_rounds` rounds")?;
-
-    // this is your assumed probability for winning if you exit in round n
-    let winning_prob: Vec<_> = (0..=max_round)
-        .map(|x| {
-            x.saturating_sub(2.min(max_round.saturating_sub(1))) as f32
-                / max_round.saturating_sub(2.min(max_round.saturating_sub(1))) as f32
-        })
-        .map(sstep)
-        .collect();
+        .context("round offset can not be less than the number of already selected teams")?;
 
     // the maximum expected win probability given teams already selected and the number of strikes
     // remaining
@@ -156,12 +168,12 @@ fn main() -> Result<()> {
     // them.
     let probs = {
         let mut curr_probs: Vec<_> = odds
-            .chunks_exact(teams.len())
+            .chunks_exact(num_teams)
             .flat_map(|chunk| chunk.iter().copied().enumerate())
             .map(|(i, x)| ((1 as TeamsMask) << i as u32, x))
             .collect();
         // println!("{:#?}", curr_probs);
-        curr_probs.chunks_exact_mut(teams.len()).for_each(|chunk| {
+        curr_probs.chunks_exact_mut(num_teams).for_each(|chunk| {
             chunk.sort_unstable_by(|a, b| {
                 a.1.partial_cmp(&b.1)
                     .unwrap_or_else(|| (!a.1.is_nan()).cmp(&!b.1.is_nan()))
@@ -176,7 +188,7 @@ fn main() -> Result<()> {
     // where the number of teams picked so far is `t` and the number of strikes remaining is `s`,
     // then `max_for_teams_strikes[t * max_strikes + s]` is an upper bound on the possible win prob
     // with this
-    let max_for_teams_strikes = {
+    let max_for_teams_mulligans = {
         let mut temp = probs
             .chunks_exact(num_teams)
             .take(max_round as usize)
@@ -184,9 +196,9 @@ fn main() -> Result<()> {
             .enumerate()
             .rev()
             .try_fold(
-                vec![1.0f32; max_strikes as usize + 1],
+                vec![1.0f32; mulligans as usize + 1],
                 |mut acc, (i, p)| -> Result<Vec<_>> {
-                    let row_sz = max_strikes as usize + 1;
+                    let row_sz = mulligans as usize + 1;
                     acc.extend_from_within(acc.len() - row_sz..);
                     let bisection_pt = acc.len() - row_sz;
                     let (prev_arr, new_arr) = acc.split_at_mut(bisection_pt);
@@ -209,16 +221,18 @@ fn main() -> Result<()> {
         temp
     };
 
-    let curr_mask = 0 as TeamsMask;
+    let curr_mask = curr_teams;
     {
         // helper function for creating the iterator, had to be this way to store the result in a
         // vector bc I can't name the iterator's type
         let get_iter = |mask: TeamsMask, strikes: u32| {
             let round = mask.count_ones() as usize;
-            let max_pw =
-                max_for_teams_strikes[(round + 1) * max_strikes as usize + strikes as usize];
+            let max_pw = max_for_teams_mulligans
+                [(round - round_offset as usize + 1) * mulligans as usize + strikes as usize];
             let max_pl = if strikes > 0 {
-                max_for_teams_strikes[(round + 1) * max_strikes as usize + strikes as usize - 1]
+                max_for_teams_mulligans[(round - round_offset as usize + 1) * mulligans as usize
+                    + strikes as usize
+                    - 1]
             } else {
                 winning_prob[round]
             };
@@ -228,7 +242,8 @@ fn main() -> Result<()> {
                 max_pw,
                 max_pl,
                 f32::NEG_INFINITY,
-                probs[round * num_teams..(round + 1) * num_teams]
+                probs[(round - round_offset as usize) * num_teams
+                    ..(round - round_offset as usize + 1) * num_teams]
                     .iter()
                     .take(max_round as usize)
                     .filter(move |(t, prob)| !prob.is_nan() && (t & mask) == 0)
@@ -237,16 +252,16 @@ fn main() -> Result<()> {
         };
 
         // the stack of combinations of teams and strikes to check while searching
-        let mut iter_stack = vec![get_iter(curr_mask, max_strikes); 1];
+        let mut iter_stack = vec![get_iter(curr_mask, mulligans); 1];
 
         iter_stack.extend(
             (0..num_teams)
                 .filter(|&idx| ((1 as TeamsMask) << (idx as u32)) & curr_mask == 0)
                 .flat_map(|idx| {
-                    (0..=max_strikes.min(1)).map(move |num| {
+                    (0..=mulligans.min(1)).map(move |num| {
                         get_iter(
                             curr_mask | ((1 as TeamsMask) << (idx as u32)),
-                            max_strikes - num,
+                            mulligans - num,
                         )
                     })
                 }),
@@ -254,12 +269,12 @@ fn main() -> Result<()> {
 
         'outer: while !iter_stack.is_empty() {
             // Safety: garunteed by the while loop check
-            let (mask, strikes, max_pw, max_pl, max_win_prob, iter) =
+            let (mask, curr_muls, max_pw, max_pl, max_win_prob, iter) =
                 unsafe { iter_stack.last_mut().unwrap_unchecked() };
 
             // shadow the following so that I can access them without dereferencing
             let mask = *mask;
-            let strikes = *strikes;
+            let curr_muls = *curr_muls;
             let max_pw = *max_pw;
             let max_pl = *max_pl;
 
@@ -267,7 +282,7 @@ fn main() -> Result<()> {
 
             if round >= max_round - 1 {
                 // then we have reached the end of the number of rounds that are required
-                let win_prob = if strikes > 0 {
+                let win_prob = if curr_muls > 0 {
                     1.0
                 } else {
                     let prob = iter.next().unwrap().1;
@@ -275,7 +290,7 @@ fn main() -> Result<()> {
                 };
 
                 *max_win_prob = win_prob;
-            } else if strikes > 0 {
+            } else if curr_muls > 0 {
                 // we have to use `peek` for the inner loop as we don't want to advance the iterator
                 // if we have to contiue out of it.
                 'inner: while let Some(&&(t, prob)) = iter.peek() {
@@ -287,23 +302,23 @@ fn main() -> Result<()> {
                     }
 
                     let win_prob = match (
-                        max_expected.get(&(mask | t, strikes)),
-                        max_expected.get(&(mask | t, strikes - 1)),
+                        max_expected.get(&(mask | t, curr_muls)),
+                        max_expected.get(&(mask | t, curr_muls - 1)),
                     ) {
                         (Some(&win_prob), Some(&lose_prob)) => {
                             win_prob * prob + lose_prob * (1.0 - prob)
                         }
                         (None, Some(&_)) => {
-                            iter_stack.push(get_iter(mask | t, strikes));
+                            iter_stack.push(get_iter(mask | t, curr_muls));
                             continue 'outer;
                         }
                         (Some(&_), None) => {
-                            iter_stack.push(get_iter(mask | t, strikes - 1));
+                            iter_stack.push(get_iter(mask | t, curr_muls - 1));
                             continue 'outer;
                         }
                         (None, None) => {
-                            iter_stack.push(get_iter(mask | t, strikes));
-                            iter_stack.push(get_iter(mask | t, strikes - 1));
+                            iter_stack.push(get_iter(mask | t, curr_muls));
+                            iter_stack.push(get_iter(mask | t, curr_muls - 1));
                             continue 'outer;
                         }
                     };
@@ -325,12 +340,13 @@ fn main() -> Result<()> {
                         break 'inner;
                     }
 
-                    let win_prob = if let Some(&win_prob) = max_expected.get(&(mask | t, strikes)) {
+                    let win_prob = if let Some(&win_prob) = max_expected.get(&(mask | t, curr_muls))
+                    {
                         // if `strikes == 0` then `max_pl` is the winning probability if we exit
                         // in the current round
                         win_prob * prob + max_pl * (1.0 - prob)
                     } else {
-                        iter_stack.push(get_iter(mask | t, strikes));
+                        iter_stack.push(get_iter(mask | t, curr_muls));
                         continue 'outer;
                     };
 
@@ -342,47 +358,128 @@ fn main() -> Result<()> {
                 }
             }
 
-            max_expected.insert((mask, strikes), *max_win_prob);
+            max_expected.insert((mask, curr_muls), *max_win_prob);
             iter_stack.pop();
         }
     }
 
-    println!(
-        "best odds: {:>02.5}%",
-        max_expected[&(curr_mask, max_strikes)] * 100.0
-    );
-
-    println!("|-{:-<24}-|-{:-^16}-|", "", "");
-    println!("| {:<24} | {:^16} |", "Team", "Max win prob (%)");
-    println!("|-{:-<24}-|-{:-^16}-|", "", "");
-    let mut results: Vec<_> = probs[curr_mask.count_ones() as usize * num_teams
-        ..(curr_mask.count_ones() + 1) as usize * num_teams]
+    let mut results: Vec<_> = probs[(curr_mask.count_ones() - round_offset) as usize * num_teams
+        ..(curr_mask.count_ones() - round_offset + 1) as usize * num_teams]
         .iter()
         .filter(|&&(idx, _p)| idx & curr_mask == 0)
         .map(|x| {
             (
-                teams[x.0.trailing_zeros() as usize],
-                (max_expected[&(curr_mask | x.0, max_strikes)] * x.1
-                    + if max_strikes > 0 {
-                        max_expected[&(curr_mask | x.0, max_strikes - 1)] * (1.0 - x.1)
+                x.0.trailing_zeros() as usize,
+                (max_expected[&(curr_mask | x.0, mulligans)] * x.1
+                    + if mulligans > 0 {
+                        max_expected[&(curr_mask | x.0, mulligans - 1)] * (1.0 - x.1)
                     } else {
                         winning_prob[curr_mask.count_ones() as usize] * (1.0 - x.1)
-                    })
-                    * 100.0,
+                    }),
+                x.1,
             )
         })
         .collect();
+
     results.sort_by(|a, b| {
         a.1.partial_cmp(&b.1)
             .unwrap_or_else(|| (!a.1.is_nan()).cmp(&!b.1.is_nan()))
             .reverse()
     });
 
-    results.iter().for_each(|&(s, pct)| {
-        println!("| {:<24} | {:^16} |", s, format!("{:02.5}%", pct));
+    Ok(results)
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+
+    let csv_contents =
+        fs::read_to_string(args.prob_file_path).context("unable to read the csv file")?;
+
+    let (teams, odds) = read_csv(&csv_contents).context("unable to parse the csv file")?;
+    (TeamsMask::BITS as usize >= teams.len())
+        .then_some(())
+        .with_context(|| {
+            format!(
+                "too many teams for the size of `TeamsMask`: {}",
+                teams.len()
+            )
+        })?;
+
+    let curr_mask = args
+        .teams
+        .iter()
+        .map(|s1| (s1, teams.iter().position(|s2| s1 == s2)))
+        .try_fold(0 as TeamsMask, |acc, (s, idx)| -> Result<_> {
+            Ok(acc
+                | ((1 as TeamsMask)
+                    << idx.with_context(|| format!("unable to find team: {}", s))?))
+        })?;
+
+    let num_teams = teams.len();
+
+    // this is your assumed probability for winning if you exit in round n
+    let max_round = odds.len() / num_teams + args.starting_round as usize;
+    let winning_prob: Vec<_> = (0..=max_round)
+        .map(|x| {
+            x.saturating_sub(8.min(max_round.saturating_sub(1))) as f32
+                / max_round.saturating_sub(8.min(max_round.saturating_sub(1))) as f32
+        })
+        .map(sstep)
+        .collect();
+
+    println!("|{:=^78}|", "");
+    println!("|{:^78}|", "Current Win Probabilty by Round Exited");
+    println!("|{:=^7}|{:=^70}|", "", "");
+    winning_prob.chunks(9).enumerate().for_each(|(row, chunk)| {
+        print!("| {:<5} |   ", "Round");
+        for round in row * 9..row * 9 + chunk.len() {
+            print!(" {:^6}", round);
+        }
+        println!("    {:width$}|", "", width = (9 - chunk.len()) * 7);
+        print!("| {:<5} |   ", "Prob.");
+        for prob in chunk {
+            print!(" {:^6}", format!("{:02.1}%", prob * 100.0));
+        }
+        println!("    {:width$}|", "", width = (9 - chunk.len()) * 7);
+        println!("|{:-^7}|{:-^70}|", "", "");
     });
 
-    println!("|-{:-<24}-|-{:-^16}-|", "", "");
+    let results = solve(
+        &odds,
+        &winning_prob,
+        num_teams,
+        curr_mask,
+        args.mulligans,
+        args.starting_round,
+    )
+    .context("unable to solve for max win prob")?;
+
+    println!("|={:=<62}=|", "");
+    println!(
+        "| Round {:>55}. |",
+        curr_mask.count_ones() - args.starting_round + 1
+    );
+    println!("|={:=<24}=|={:=^16}=|={:=^16}=|", "", "", "");
+    println!(
+        "| {:<24} | {:^16} | {:^16} |",
+        "Team", "Max win prob (%)", "Game prob (%)"
+    );
+    println!("|-{:-<24}-|-{:-^16}-|-{:-^16}-|", "", "", "");
+
+    results
+        .iter()
+        .filter(|x| !x.1.is_nan())
+        .for_each(|&(s, pct, g)| {
+            println!(
+                "| {:<24} | {:^16} | {:^16} |",
+                teams[s],
+                format!("{:02.5}%", pct * 100.0),
+                format!("{:02.5}%", g * 100.0)
+            );
+        });
+
+    println!("|-{:-<24}-|-{:-^16}-|-{:-^16}-|", "", "", "");
 
     Ok(())
 }
