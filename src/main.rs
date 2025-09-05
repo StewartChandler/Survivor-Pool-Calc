@@ -476,10 +476,7 @@ fn main() -> Result<()> {
 
     println!();
     println!("|={:=<62}=|", "");
-    println!(
-        "| Round {:>55}. |",
-        curr_mask.count_ones() - args.starting_round + 1
-    );
+    println!("| Round {:>55}. |", curr_mask.count_ones() + 1);
     println!("| Mulligans {:>51}. |", args.mulligans);
     println!("|={:=<24}=|={:=^16}=|={:=^16}=|", "", "", "");
     println!(
