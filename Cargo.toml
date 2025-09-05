@@ -7,7 +7,6 @@ description = """A simple CLI program for calculating the maximum odds for every
 readme = "README.md"
 repository = "https://github.com/StewartChandler/Survivor-Pool-Calc"
 license = "GPL-3.0"
-license-file = "LICENSE.txt"
 version = "0.1.0"
 edition = "2024"
 
