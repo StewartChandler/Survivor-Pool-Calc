@@ -12,6 +12,9 @@ struct Args {
     #[arg(short, long, value_name = "FILE")]
     prob_file_path: PathBuf,
 
+    /// The teams that you have selected so far for the survivor pool (if you want to remove a
+    /// particular team without progressing the round that you are in, add 1 to the starting round
+    /// (see: `--starting-round`))
     #[arg(value_name = "TEAM")]
     teams: Vec<String>,
 
